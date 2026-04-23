@@ -167,6 +167,15 @@ claude mcp add ffmpeg -- node C:/Users/user/Desktop/ffmpeg-mcp/dist/index.js
 - **相対パスは CWD から resolve**。LLM が相対パスを渡しても意図通りの場所に書き出される。
 - **タイムアウト既定 10 分**。長時間エンコードは `timeout` で上書き。
 
+## v0.2.1 修正
+
+一部の MCP クライアント (Claude Code の LLM ツール使用パス等) が **object / array 引数を JSON 文字列化してからサーバーに渡す**挙動があり、`extra_args` / `args` / `input_paths` / `resolution` / `size` / `jobs` が文字列で届くと zod バリデーションで落ちるか、`args.push(...p.extra_args)` で文字列を spread して 1 文字ずつ ffmpeg の引数に混入する等の事故が起きていた。
+
+修正内容:
+- `extra_args` / `args` / `input_paths` / `resolution` / `size` / `jobs` の zod schema を `z.union([<本来の型>, z.string()])` に緩和
+- `coerceArray()` / `coerceObject()` ヘルパを追加し、文字列で届いた場合は `JSON.parse` で配列 / オブジェクトに戻してから使用
+- `batch` の各 job 内部のネスト配列 (`extra_args` / `resolution` / `size` / `args` / `input_paths`) も coerce してから dispatch
+
 ## Attribution
 
 - [FFmpeg](https://ffmpeg.org/) © FFmpeg developers（LGPL/GPL）— 本 MCP はラッパーであり FFmpeg 本体のライセンスに従う

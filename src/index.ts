@@ -12,6 +12,37 @@ const FFPROBE = process.env.FFPROBE_PATH || "ffprobe";
 const DEFAULT_TIMEOUT = parseInt(process.env.FFMPEG_TIMEOUT || "600000", 10);
 const MAX_STDERR = 16384;
 
+// 一部の MCP クライアント (Claude Code の LLM ツール使用パス等) は
+// object / array 引数を JSON 文字列化して送ってくる事がある。
+// その場合でも正しく配列 / オブジェクトとして扱える様に緩和する。
+function coerceArray<T = unknown>(val: unknown): T[] | undefined {
+  if (val === undefined || val === null) return undefined;
+  if (Array.isArray(val)) return val as T[];
+  if (typeof val === "string") {
+    try {
+      const parsed = JSON.parse(val);
+      if (Array.isArray(parsed)) return parsed as T[];
+    } catch {}
+    return undefined;
+  }
+  return undefined;
+}
+
+function coerceObject<T>(val: unknown): T | undefined {
+  if (val === undefined || val === null) return undefined;
+  if (typeof val === "string") {
+    try {
+      const parsed = JSON.parse(val);
+      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as T;
+      }
+    } catch {}
+    return undefined;
+  }
+  if (typeof val === "object" && !Array.isArray(val)) return val as T;
+  return undefined;
+}
+
 type RunResult = {
   exit_code: number | null;
   signal: string | null;
@@ -441,7 +472,7 @@ async function version() {
   };
 }
 
-const server = new McpServer({ name: "ffmpeg", version: "0.1.0" });
+const server = new McpServer({ name: "ffmpeg", version: "0.2.1" });
 
 server.tool(
   "ffmpeg",
@@ -466,8 +497,8 @@ Paths are resolved to absolute. stderr is truncated to the last 16 KB. Default p
     ]).describe("Action to perform"),
     input: z.string().optional().describe("Input file path (probe/convert/trim/extract_audio/thumbnail)"),
     output: z.string().optional().describe("Output file path"),
-    input_paths: z.array(z.string()).optional().describe("Input paths for concat"),
-    args: z.array(z.string()).optional().describe("Raw args for the 'run' action"),
+    input_paths: z.union([z.array(z.string()), z.string()]).optional().describe("Input paths for concat"),
+    args: z.union([z.array(z.string()), z.string()]).optional().describe("Raw args for the 'run' action"),
     use_ffprobe: z.boolean().optional().describe("run: invoke ffprobe instead of ffmpeg"),
     video_codec: z.string().optional().describe("e.g. libx264, libvpx-vp9, copy"),
     audio_codec: z.string().optional().describe("e.g. aac, libmp3lame, libopus, copy"),
@@ -476,15 +507,15 @@ Paths are resolved to absolute. stderr is truncated to the last 16 KB. Default p
     video_bitrate: z.string().optional().describe("e.g. '2M'"),
     audio_bitrate: z.string().optional().describe("e.g. '192k'"),
     fps: z.number().optional().describe("Output frame rate"),
-    resolution: z.array(z.number()).length(2).optional().describe("[width, height]"),
+    resolution: z.union([z.array(z.number()).length(2), z.string()]).optional().describe("[width, height]"),
     start: z.union([z.string(), z.number()]).optional().describe("Seek start (sec or hh:mm:ss)"),
     end: z.union([z.string(), z.number()]).optional().describe("trim: end time"),
     duration: z.union([z.string(), z.number()]).optional().describe("Duration (sec or hh:mm:ss)"),
     copy: z.boolean().optional().describe("trim: stream copy mode (default true)"),
     time: z.union([z.string(), z.number()]).optional().describe("thumbnail: frame time"),
-    size: z.array(z.number()).length(2).optional().describe("thumbnail: [w,h]"),
+    size: z.union([z.array(z.number()).length(2), z.string()]).optional().describe("thumbnail: [w,h]"),
     overwrite: z.boolean().optional().describe("Overwrite existing output (default true)"),
-    extra_args: z.array(z.string()).optional().describe("convert: extra ffmpeg args"),
+    extra_args: z.union([z.array(z.string()), z.string()]).optional().describe("convert: extra ffmpeg args"),
     timeout: z.number().optional().describe("Per-call timeout ms (run/convert)"),
     watermark_path: z.string().optional().describe("watermark: overlay image path"),
     position: z.enum(["top-left", "top-right", "bottom-left", "bottom-right", "center"]).optional().describe("watermark: placement"),
@@ -497,11 +528,19 @@ Paths are resolved to absolute. stderr is truncated to the last 16 KB. Default p
     speed_factor: z.number().positive().optional().describe("speed: playback speed multiplier (>0, e.g. 2 = 2x)"),
     video_only: z.boolean().optional().describe("speed: only apply to video (mute audio)"),
     audio_only: z.boolean().optional().describe("speed: only apply to audio (copy video)"),
-    jobs: z.array(z.object({ action: z.string() }).passthrough()).optional().describe("batch: list of job specs {action: ..., ...args}"),
+    jobs: z.union([z.array(z.object({ action: z.string() }).passthrough()), z.string()]).optional().describe("batch: list of job specs {action: ..., ...args}"),
     stop_on_error: z.boolean().optional().describe("batch: abort after first failure"),
   },
   async (params) => {
     const a = params.action;
+    // LLM が配列/オブジェクト引数を JSON 文字列化して送ってくる事があるので
+    // 使う前に必ず coerce を通す。
+    const resolution = coerceArray<number>(params.resolution) as [number, number] | undefined;
+    const size = coerceArray<number>(params.size) as [number, number] | undefined;
+    const extraArgs = coerceArray<string>(params.extra_args);
+    const rawArgs = coerceArray<string>(params.args);
+    const inputPaths = coerceArray<string>(params.input_paths);
+    const jobs = coerceArray<Record<string, any>>(params.jobs);
     try {
       if (a === "probe") {
         if (!params.input) return errContent("probe requires 'input'");
@@ -509,7 +548,7 @@ Paths are resolved to absolute. stderr is truncated to the last 16 KB. Default p
       }
       if (a === "convert") {
         if (!params.input || !params.output) return errContent("convert requires 'input' and 'output'");
-        return runResponse(await convert(params));
+        return runResponse(await convert({ ...params, resolution, extra_args: extraArgs }));
       }
       if (a === "trim") {
         if (!params.input || !params.output || params.start === undefined) {
@@ -518,8 +557,8 @@ Paths are resolved to absolute. stderr is truncated to the last 16 KB. Default p
         return runResponse(await trim(params as any));
       }
       if (a === "concat") {
-        if (!params.input_paths || !params.output) return errContent("concat requires 'input_paths' and 'output'");
-        return runResponse(await concat(params as any));
+        if (!inputPaths || inputPaths.length === 0 || !params.output) return errContent("concat requires 'input_paths' and 'output'");
+        return runResponse(await concat({ input_paths: inputPaths, output: params.output, overwrite: params.overwrite, timeout: params.timeout }));
       }
       if (a === "extract_audio") {
         if (!params.input || !params.output) return errContent("extract_audio requires 'input' and 'output'");
@@ -527,11 +566,11 @@ Paths are resolved to absolute. stderr is truncated to the last 16 KB. Default p
       }
       if (a === "thumbnail") {
         if (!params.input || !params.output) return errContent("thumbnail requires 'input' and 'output'");
-        return runResponse(await thumbnail(params as any));
+        return runResponse(await thumbnail({ ...(params as any), size }));
       }
       if (a === "run") {
-        if (!params.args) return errContent("run requires 'args'");
-        return runResponse(await run(params as any));
+        if (!rawArgs || rawArgs.length === 0) return errContent("run requires 'args'");
+        return runResponse(await run({ args: rawArgs, use_ffprobe: params.use_ffprobe, timeout: params.timeout }));
       }
       if (a === "version") {
         return textContent(await version());
@@ -569,8 +608,19 @@ Paths are resolved to absolute. stderr is truncated to the last 16 KB. Default p
         }));
       }
       if (a === "batch") {
-        if (!params.jobs || params.jobs.length === 0) return errContent("batch requires 'jobs' (non-empty)");
-        return textContent(await batch({ jobs: params.jobs as any, stop_on_error: params.stop_on_error }));
+        if (!jobs || jobs.length === 0) return errContent("batch requires 'jobs' (non-empty)");
+        // 各 job 内のネスト配列 (extra_args / resolution / size / args / input_paths) も
+        // 文字列化されている可能性があるので、batch 側で一括で coerce しておく。
+        const normalizedJobs = jobs.map((j) => {
+          const nj: Record<string, any> = { ...j };
+          if ("extra_args" in nj) nj.extra_args = coerceArray<string>(nj.extra_args) ?? nj.extra_args;
+          if ("resolution" in nj) nj.resolution = coerceArray<number>(nj.resolution) ?? nj.resolution;
+          if ("size" in nj) nj.size = coerceArray<number>(nj.size) ?? nj.size;
+          if ("args" in nj) nj.args = coerceArray<string>(nj.args) ?? nj.args;
+          if ("input_paths" in nj) nj.input_paths = coerceArray<string>(nj.input_paths) ?? nj.input_paths;
+          return nj as BatchJob;
+        });
+        return textContent(await batch({ jobs: normalizedJobs, stop_on_error: params.stop_on_error }));
       }
       return errContent(`unknown action: ${a}`);
     } catch (err: any) {

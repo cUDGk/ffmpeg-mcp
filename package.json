@@ -1,6 +1,6 @@
 {
   "name": "ffmpeg-mcp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "MCP stdio server wrapping ffmpeg / ffprobe — safe argument passing, structured probe JSON, high-level shortcuts (convert / trim / concat / thumbnail / extract_audio)",
   "type": "module",
   "main": "dist/index.js",
