@@ -258,6 +258,177 @@ async function run(p: { args: string[]; use_ffprobe?: boolean; timeout?: number 
   return runCmd(cmd, p.args, { timeout: p.timeout });
 }
 
+async function watermark(p: {
+  input: string;
+  watermark: string;
+  output: string;
+  position?: "top-left" | "top-right" | "bottom-left" | "bottom-right" | "center";
+  margin?: number;
+  scale?: number;
+  opacity?: number;
+  overwrite?: boolean;
+  timeout?: number;
+}) {
+  const pos = p.position ?? "bottom-right";
+  const m = p.margin ?? 20;
+  const overlayXY: Record<string, string> = {
+    "top-left": `${m}:${m}`,
+    "top-right": `main_w-overlay_w-${m}:${m}`,
+    "bottom-left": `${m}:main_h-overlay_h-${m}`,
+    "bottom-right": `main_w-overlay_w-${m}:main_h-overlay_h-${m}`,
+    "center": `(main_w-overlay_w)/2:(main_h-overlay_h)/2`,
+  };
+  const scale = p.scale ?? 0.15;
+  const opacity = p.opacity ?? 1.0;
+  const wmFilter = [
+    `scale=iw*${scale}:-1`,
+    opacity < 1 ? `format=rgba,colorchannelmixer=aa=${opacity}` : null,
+  ].filter(Boolean).join(",");
+  const filterComplex = `[1:v]${wmFilter}[wm];[0:v][wm]overlay=${overlayXY[pos]}`;
+  const args: string[] = [];
+  args.push(p.overwrite === false ? "-n" : "-y");
+  args.push("-i", resolve(p.input));
+  args.push("-i", resolve(p.watermark));
+  args.push("-filter_complex", filterComplex);
+  args.push("-map", "0:a?", "-c:a", "copy");
+  args.push("-c:v", "libx264", "-preset", "fast", "-crf", "22");
+  args.push(resolve(p.output));
+  return runCmd(FFMPEG, args, { timeout: p.timeout });
+}
+
+async function loudnormPass1(input: string): Promise<{
+  input_i: number; input_tp: number; input_lra: number;
+  input_thresh: number; target_offset: number;
+}> {
+  const args = [
+    "-hide_banner", "-nostats",
+    "-i", resolve(input),
+    "-af", "loudnorm=print_format=json",
+    "-f", "null", process.platform === "win32" ? "NUL" : "/dev/null",
+  ];
+  const r = await runCmd(FFMPEG, args);
+  // loudnorm prints the JSON block at the END of stderr
+  const match = r.stderr.match(/\{[\s\S]*?"target_offset"\s*:[\s\S]*?\}/);
+  if (!match) throw new Error(`loudnorm pass 1 failed to print JSON block. stderr tail:\n${r.stderr.slice(-2000)}`);
+  const j = JSON.parse(match[0]);
+  return {
+    input_i: parseFloat(j.input_i),
+    input_tp: parseFloat(j.input_tp),
+    input_lra: parseFloat(j.input_lra),
+    input_thresh: parseFloat(j.input_thresh),
+    target_offset: parseFloat(j.target_offset),
+  };
+}
+
+async function loudnorm(p: {
+  input: string; output: string;
+  target_i?: number;
+  target_tp?: number;
+  target_lra?: number;
+  audio_codec?: string;
+  audio_bitrate?: string;
+  overwrite?: boolean;
+  timeout?: number;
+}) {
+  const targetI = p.target_i ?? -16;
+  const targetTP = p.target_tp ?? -1.5;
+  const targetLRA = p.target_lra ?? 11;
+  const measured = await loudnormPass1(p.input);
+  const args: string[] = [];
+  args.push(p.overwrite === false ? "-n" : "-y");
+  args.push("-i", resolve(p.input));
+  const af = [
+    `loudnorm=I=${targetI}:TP=${targetTP}:LRA=${targetLRA}`,
+    `measured_I=${measured.input_i}`,
+    `measured_TP=${measured.input_tp}`,
+    `measured_LRA=${measured.input_lra}`,
+    `measured_thresh=${measured.input_thresh}`,
+    `offset=${measured.target_offset}`,
+    `linear=true:print_format=summary`,
+  ].join(":");
+  args.push("-af", af);
+  args.push("-c:a", p.audio_codec ?? "aac");
+  if (p.audio_bitrate) args.push("-b:a", p.audio_bitrate);
+  args.push("-ar", "48000");
+  args.push(resolve(p.output));
+  const r = await runCmd(FFMPEG, args, { timeout: p.timeout });
+  return { ...r, measured, target: { I: targetI, TP: targetTP, LRA: targetLRA } };
+}
+
+function buildAtempoChain(speed: number): string {
+  const filters: string[] = [];
+  let s = speed;
+  while (s > 2.0) { filters.push("atempo=2.0"); s /= 2.0; }
+  while (s < 0.5) { filters.push("atempo=0.5"); s /= 0.5; }
+  if (Math.abs(s - 1) > 1e-6) filters.push(`atempo=${s}`);
+  return filters.length ? filters.join(",") : "anull";
+}
+
+async function changeSpeed(p: {
+  input: string; output: string;
+  speed: number;
+  video_only?: boolean;
+  audio_only?: boolean;
+  overwrite?: boolean;
+  timeout?: number;
+}) {
+  if (p.speed <= 0) throw new Error("speed must be > 0");
+  const args: string[] = [];
+  args.push(p.overwrite === false ? "-n" : "-y");
+  args.push("-i", resolve(p.input));
+  if (!p.audio_only) {
+    args.push("-filter:v", `setpts=${(1 / p.speed).toFixed(6)}*PTS`);
+  } else {
+    args.push("-c:v", "copy");
+  }
+  if (!p.video_only) {
+    args.push("-filter:a", buildAtempoChain(p.speed));
+  } else {
+    args.push("-an");
+  }
+  args.push(resolve(p.output));
+  return runCmd(FFMPEG, args, { timeout: p.timeout });
+}
+
+type BatchJob = {
+  action: "convert" | "trim" | "extract_audio" | "thumbnail" | "watermark" | "loudnorm" | "speed" | "run";
+  [k: string]: any;
+};
+
+async function batch(p: { jobs: BatchJob[]; stop_on_error?: boolean }) {
+  const results: any[] = [];
+  for (const [i, job] of p.jobs.entries()) {
+    try {
+      let r: any;
+      switch (job.action) {
+        case "convert": r = await convert(job as any); break;
+        case "trim": r = await trim(job as any); break;
+        case "extract_audio": r = await extractAudio(job as any); break;
+        case "thumbnail": r = await thumbnail(job as any); break;
+        case "watermark": r = await watermark(job as any); break;
+        case "loudnorm": r = await loudnorm(job as any); break;
+        case "speed": r = await changeSpeed(job as any); break;
+        case "run": r = await run(job as any); break;
+        default: throw new Error(`unknown batch action: ${job.action}`);
+      }
+      const ok = (r as any).exit_code === 0;
+      results.push({ index: i, action: job.action, ok, exit_code: (r as any).exit_code, duration_ms: (r as any).duration_ms, stderr: ((r as any).stderr ?? "").slice(-800) });
+      if (!ok && p.stop_on_error) break;
+    } catch (err: any) {
+      results.push({ index: i, action: job.action, ok: false, error: err?.message ?? String(err) });
+      if (p.stop_on_error) break;
+    }
+  }
+  const okCount = results.filter((r) => r.ok).length;
+  return {
+    total: p.jobs.length,
+    processed: results.length,
+    succeeded: okCount,
+    failed: results.length - okCount,
+    results,
+  };
+}
+
 async function version() {
   const [m, p] = await Promise.all([
     runCmd(FFMPEG, ["-version"], { timeout: 10000 }),
@@ -291,6 +462,7 @@ Paths are resolved to absolute. stderr is truncated to the last 16 KB. Default p
     action: z.enum([
       "probe", "convert", "trim", "concat",
       "extract_audio", "thumbnail", "run", "version",
+      "watermark", "loudnorm", "speed", "batch",
     ]).describe("Action to perform"),
     input: z.string().optional().describe("Input file path (probe/convert/trim/extract_audio/thumbnail)"),
     output: z.string().optional().describe("Output file path"),
@@ -314,6 +486,18 @@ Paths are resolved to absolute. stderr is truncated to the last 16 KB. Default p
     overwrite: z.boolean().optional().describe("Overwrite existing output (default true)"),
     extra_args: z.array(z.string()).optional().describe("convert: extra ffmpeg args"),
     timeout: z.number().optional().describe("Per-call timeout ms (run/convert)"),
+    watermark_path: z.string().optional().describe("watermark: overlay image path"),
+    position: z.enum(["top-left", "top-right", "bottom-left", "bottom-right", "center"]).optional().describe("watermark: placement"),
+    margin: z.number().optional().describe("watermark: pixels from edge (default 20)"),
+    opacity: z.number().min(0).max(1).optional().describe("watermark: alpha 0..1 (default 1)"),
+    target_i: z.number().optional().describe("loudnorm: target integrated LUFS (default -16)"),
+    target_tp: z.number().optional().describe("loudnorm: target true peak dBFS (default -1.5)"),
+    target_lra: z.number().optional().describe("loudnorm: target loudness range (default 11)"),
+    speed_factor: z.number().positive().optional().describe("speed: playback speed multiplier (>0, e.g. 2 = 2x)"),
+    video_only: z.boolean().optional().describe("speed: only apply to video (mute audio)"),
+    audio_only: z.boolean().optional().describe("speed: only apply to audio (copy video)"),
+    jobs: z.array(z.object({ action: z.string() }).passthrough()).optional().describe("batch: list of job specs {action: ..., ...args}"),
+    stop_on_error: z.boolean().optional().describe("batch: abort after first failure"),
   },
   async (params) => {
     const a = params.action;
@@ -350,6 +534,42 @@ Paths are resolved to absolute. stderr is truncated to the last 16 KB. Default p
       }
       if (a === "version") {
         return textContent(await version());
+      }
+      if (a === "watermark") {
+        if (!params.input || !params.output || !params.watermark_path) return errContent("watermark requires 'input', 'output', 'watermark_path'");
+        return runResponse(await watermark({
+          input: params.input, output: params.output,
+          watermark: params.watermark_path,
+          position: params.position, margin: params.margin,
+          scale: params.resolution ? params.resolution[0] : undefined,
+          opacity: params.opacity,
+          overwrite: params.overwrite, timeout: params.timeout,
+        }));
+      }
+      if (a === "loudnorm") {
+        if (!params.input || !params.output) return errContent("loudnorm requires 'input' and 'output'");
+        const r = await loudnorm({
+          input: params.input, output: params.output,
+          target_i: params.target_i, target_tp: params.target_tp, target_lra: params.target_lra,
+          audio_codec: params.audio_codec, audio_bitrate: params.audio_bitrate,
+          overwrite: params.overwrite, timeout: params.timeout,
+        });
+        const res = textContent(r);
+        if ((r as any).exit_code !== 0) (res as any).isError = true;
+        return res;
+      }
+      if (a === "speed") {
+        if (!params.input || !params.output || params.speed_factor === undefined) return errContent("speed requires 'input', 'output', 'speed_factor'");
+        return runResponse(await changeSpeed({
+          input: params.input, output: params.output,
+          speed: params.speed_factor,
+          video_only: params.video_only, audio_only: params.audio_only,
+          overwrite: params.overwrite, timeout: params.timeout,
+        }));
+      }
+      if (a === "batch") {
+        if (!params.jobs || params.jobs.length === 0) return errContent("batch requires 'jobs' (non-empty)");
+        return textContent(await batch({ jobs: params.jobs as any, stop_on_error: params.stop_on_error }));
       }
       return errContent(`unknown action: ${a}`);
     } catch (err: any) {
