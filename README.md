@@ -33,7 +33,7 @@ LLM に `ffmpeg -i ... -c:v libx264 ...` を文字列として書かせると、
 |---|---|
 | `probe` | ffprobe を JSON で叩き、format / streams / chapters を間引いて返す（未知ファイルへの第一手） |
 | `convert` | 再エンコード。`video_codec` / `audio_codec` / `crf` / `preset` / `video_bitrate` / `audio_bitrate` / `fps` / `resolution=[w,h]` / オプションの `start`・`duration` / `extra_args` |
-| `trim` | 既定で `-c copy` による**無劣化カット**（再エンコードなし、ほぼ瞬時）。`copy: false` で再エンコード可 |
+| `trim` | 既定で `-c copy` による**無劣化カット**（再エンコードなし、ほぼ瞬時）。`copy: false` で再エンコード可。**精度注意**: copy モードは I-frame 単位で seek する為、`start` が最大数秒ズレる事がある（ffmpeg の仕様）。フレーム精度が必要なら `copy: false` |
 | `concat` | concat デマクサで `input_paths[]` を無劣化結合（全入力が同コーデック/同パラメータ前提） |
 | `extract_audio` | `-vn` + オプションで `audio_codec` / `audio_bitrate`。拡張子でコーデック自動選択 |
 | `thumbnail` | 指定時刻（既定 `00:00:01`）の 1 フレームを画像として書き出し、`size=[w,h]` で縮小可 |

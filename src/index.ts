@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -21,6 +21,17 @@ type RunResult = {
   timed_out: boolean;
 };
 
+function killProc(proc: ChildProcess): void {
+  if (!proc.pid) return;
+  if (process.platform === "win32") {
+    try {
+      execFileSync("taskkill", ["/F", "/T", "/PID", String(proc.pid)], { stdio: "ignore" });
+      return;
+    } catch {}
+  }
+  try { proc.kill("SIGKILL"); } catch {}
+}
+
 function runCmd(cmd: string, args: string[], opts: { timeout?: number } = {}): Promise<RunResult> {
   const t0 = Date.now();
   const to = opts.timeout ?? DEFAULT_TIMEOUT;
@@ -31,7 +42,7 @@ function runCmd(cmd: string, args: string[], opts: { timeout?: number } = {}): P
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      proc.kill("SIGKILL");
+      killProc(proc);
     }, to);
     proc.stdout!.on("data", (c) => { stdout += c.toString("utf8"); });
     proc.stderr!.on("data", (c) => {
@@ -66,6 +77,18 @@ function errContent(msg: string) {
   return { content: [{ type: "text" as const, text: msg }], isError: true };
 }
 
+function runResponse(r: RunResult) {
+  const res = textContent(r);
+  if (r.exit_code !== 0) (res as any).isError = true;
+  return res;
+}
+
+function okResponse(data: { ok: boolean } & Record<string, unknown>) {
+  const res = textContent(data);
+  if (!data.ok) (res as any).isError = true;
+  return res;
+}
+
 async function probe(input: string) {
   const r = await runCmd(FFPROBE, [
     "-v", "error",
@@ -76,7 +99,7 @@ async function probe(input: string) {
     resolve(input),
   ], { timeout: 60000 });
   if (r.exit_code !== 0) {
-    return { ok: false, exit_code: r.exit_code, stderr: r.stderr };
+    return { ok: false as const, exit_code: r.exit_code, stderr: r.stderr };
   }
   try {
     const data = JSON.parse(r.stdout);
@@ -84,23 +107,38 @@ async function probe(input: string) {
       index: s.index,
       codec_type: s.codec_type,
       codec_name: s.codec_name,
+      codec_long_name: s.codec_long_name,
       profile: s.profile,
       width: s.width,
       height: s.height,
+      coded_width: s.coded_width,
+      coded_height: s.coded_height,
+      display_aspect_ratio: s.display_aspect_ratio,
+      sample_aspect_ratio: s.sample_aspect_ratio,
       pix_fmt: s.pix_fmt,
+      color_space: s.color_space,
+      color_range: s.color_range,
+      color_transfer: s.color_transfer,
+      color_primaries: s.color_primaries,
+      field_order: s.field_order,
       r_frame_rate: s.r_frame_rate,
+      avg_frame_rate: s.avg_frame_rate,
+      nb_frames: s.nb_frames,
       sample_rate: s.sample_rate,
       channels: s.channels,
       channel_layout: s.channel_layout,
       bit_rate: s.bit_rate,
       duration: s.duration,
+      time_base: s.time_base,
+      disposition: s.disposition,
       tags: s.tags,
     }));
     return {
-      ok: true,
+      ok: true as const,
       format: data.format && {
         filename: data.format.filename,
         format_name: data.format.format_name,
+        format_long_name: data.format.format_long_name,
         duration: data.format.duration,
         size: data.format.size,
         bit_rate: data.format.bit_rate,
@@ -111,7 +149,7 @@ async function probe(input: string) {
       chapters: data.chapters || [],
     };
   } catch (e: any) {
-    return { ok: false, error: `ffprobe json parse failed: ${e.message}`, raw: r.stdout.slice(0, 1000) };
+    return { ok: false as const, error: `ffprobe json parse failed: ${e.message}`, raw: r.stdout.slice(0, 1000) };
   }
 }
 
@@ -151,7 +189,7 @@ async function convert(p: any) {
 async function trim(p: {
   input: string; output: string;
   start: string | number; end?: string | number; duration?: string | number;
-  copy?: boolean; overwrite?: boolean;
+  copy?: boolean; overwrite?: boolean; timeout?: number;
 }) {
   const args: string[] = [];
   args.push(p.overwrite === false ? "-n" : "-y");
@@ -161,10 +199,10 @@ async function trim(p: {
   else if (p.duration !== undefined) args.push("-t", String(p.duration));
   if (p.copy !== false) args.push("-c", "copy");
   args.push(resolve(p.output));
-  return runCmd(FFMPEG, args);
+  return runCmd(FFMPEG, args, { timeout: p.timeout });
 }
 
-async function concat(p: { input_paths: string[]; output: string; overwrite?: boolean }) {
+async function concat(p: { input_paths: string[]; output: string; overwrite?: boolean; timeout?: number }) {
   const dir = mkdtempSync(join(tmpdir(), "ffmpeg-mcp-"));
   const listFile = join(dir, "list.txt");
   try {
@@ -180,7 +218,7 @@ async function concat(p: { input_paths: string[]; output: string; overwrite?: bo
       "-c", "copy",
       resolve(p.output),
     ];
-    return await runCmd(FFMPEG, args);
+    return await runCmd(FFMPEG, args, { timeout: p.timeout });
   } finally {
     try { rmSync(dir, { recursive: true, force: true }); } catch {}
   }
@@ -188,7 +226,7 @@ async function concat(p: { input_paths: string[]; output: string; overwrite?: bo
 
 async function extractAudio(p: {
   input: string; output: string; audio_codec?: string;
-  audio_bitrate?: string; overwrite?: boolean;
+  audio_bitrate?: string; overwrite?: boolean; timeout?: number;
 }) {
   const args: string[] = [];
   args.push(p.overwrite === false ? "-n" : "-y");
@@ -197,14 +235,14 @@ async function extractAudio(p: {
   if (p.audio_codec) args.push("-c:a", p.audio_codec);
   if (p.audio_bitrate) args.push("-b:a", p.audio_bitrate);
   args.push(resolve(p.output));
-  return runCmd(FFMPEG, args);
+  return runCmd(FFMPEG, args, { timeout: p.timeout });
 }
 
 async function thumbnail(p: {
   input: string; output: string;
-  time?: string | number; size?: [number, number]; overwrite?: boolean;
+  time?: string | number; size?: [number, number]; overwrite?: boolean; timeout?: number;
 }) {
-  const t = p.time ?? "00:00:01";
+  const t = p.time ?? 0;
   const args: string[] = [];
   args.push(p.overwrite === false ? "-n" : "-y");
   args.push("-ss", String(t));
@@ -212,7 +250,7 @@ async function thumbnail(p: {
   args.push("-frames:v", "1");
   if (p.size) args.push("-s", `${p.size[0]}x${p.size[1]}`);
   args.push(resolve(p.output));
-  return runCmd(FFMPEG, args);
+  return runCmd(FFMPEG, args, { timeout: p.timeout });
 }
 
 async function run(p: { args: string[]; use_ffprobe?: boolean; timeout?: number }) {
@@ -225,9 +263,10 @@ async function version() {
     runCmd(FFMPEG, ["-version"], { timeout: 10000 }),
     runCmd(FFPROBE, ["-version"], { timeout: 10000 }),
   ]);
+  const firstLine = (s: string) => (s.split(/\r?\n/)[0] ?? "").trim();
   return {
-    ffmpeg: m.stdout.split("\n")[0] || m.stderr.split("\n")[0],
-    ffprobe: p.stdout.split("\n")[0] || p.stderr.split("\n")[0],
+    ffmpeg: firstLine(m.stdout) || firstLine(m.stderr),
+    ffprobe: firstLine(p.stdout) || firstLine(p.stderr),
   };
 }
 
@@ -281,33 +320,33 @@ Paths are resolved to absolute. stderr is truncated to the last 16 KB. Default p
     try {
       if (a === "probe") {
         if (!params.input) return errContent("probe requires 'input'");
-        return textContent(await probe(params.input));
+        return okResponse(await probe(params.input));
       }
       if (a === "convert") {
         if (!params.input || !params.output) return errContent("convert requires 'input' and 'output'");
-        return textContent(await convert(params));
+        return runResponse(await convert(params));
       }
       if (a === "trim") {
         if (!params.input || !params.output || params.start === undefined) {
           return errContent("trim requires 'input', 'output', 'start'");
         }
-        return textContent(await trim(params as any));
+        return runResponse(await trim(params as any));
       }
       if (a === "concat") {
         if (!params.input_paths || !params.output) return errContent("concat requires 'input_paths' and 'output'");
-        return textContent(await concat(params as any));
+        return runResponse(await concat(params as any));
       }
       if (a === "extract_audio") {
         if (!params.input || !params.output) return errContent("extract_audio requires 'input' and 'output'");
-        return textContent(await extractAudio(params as any));
+        return runResponse(await extractAudio(params as any));
       }
       if (a === "thumbnail") {
         if (!params.input || !params.output) return errContent("thumbnail requires 'input' and 'output'");
-        return textContent(await thumbnail(params as any));
+        return runResponse(await thumbnail(params as any));
       }
       if (a === "run") {
         if (!params.args) return errContent("run requires 'args'");
-        return textContent(await run(params as any));
+        return runResponse(await run(params as any));
       }
       if (a === "version") {
         return textContent(await version());
