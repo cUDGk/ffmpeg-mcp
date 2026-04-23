@@ -489,6 +489,7 @@ Paths are resolved to absolute. stderr is truncated to the last 16 KB. Default p
     watermark_path: z.string().optional().describe("watermark: overlay image path"),
     position: z.enum(["top-left", "top-right", "bottom-left", "bottom-right", "center"]).optional().describe("watermark: placement"),
     margin: z.number().optional().describe("watermark: pixels from edge (default 20)"),
+    watermark_scale: z.number().positive().optional().describe("watermark: relative size vs. main video width (default 0.15 = 15%)"),
     opacity: z.number().min(0).max(1).optional().describe("watermark: alpha 0..1 (default 1)"),
     target_i: z.number().optional().describe("loudnorm: target integrated LUFS (default -16)"),
     target_tp: z.number().optional().describe("loudnorm: target true peak dBFS (default -1.5)"),
@@ -541,7 +542,7 @@ Paths are resolved to absolute. stderr is truncated to the last 16 KB. Default p
           input: params.input, output: params.output,
           watermark: params.watermark_path,
           position: params.position, margin: params.margin,
-          scale: params.resolution ? params.resolution[0] : undefined,
+          scale: params.watermark_scale,
           opacity: params.opacity,
           overwrite: params.overwrite, timeout: params.timeout,
         }));

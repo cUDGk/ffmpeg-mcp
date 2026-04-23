@@ -39,6 +39,10 @@ LLM に `ffmpeg -i ... -c:v libx264 ...` を文字列として書かせると、
 | `thumbnail` | 指定時刻（既定 `00:00:01`）の 1 フレームを画像として書き出し、`size=[w,h]` で縮小可 |
 | `run` | 生 args の escape hatch。`use_ffprobe: true` で ffprobe を叩く |
 | `version` | `ffmpeg -version` / `ffprobe -version` の先頭行 |
+| `watermark` | ロゴ画像を動画にオーバーレイ。`position` (top-left / top-right / bottom-left / bottom-right / center), `margin`, `watermark_scale` (メイン動画幅に対する比, デフォルト 0.15), `opacity` |
+| `loudnorm` | **EBU R128 2-pass ラウドネス正規化**。1 パス目で measured_I / TP / LRA / thresh / offset を取得、2 パス目で linear モードで再エンコード。`target_i` (-16), `target_tp` (-1.5), `target_lra` (11) がデフォルト |
+| `speed` | 再生速度変更。`setpts=PTS/speed` + `atempo` チェーン (0.5〜2.0 超える倍率も自動チェーン化)。`video_only` / `audio_only` で片方だけ |
+| `batch` | `jobs[]` を sequential 実行。`stop_on_error` で中断制御、各ジョブの ok/exit_code/duration/stderr テイルを個別レポート |
 
 ## 処理フロー
 
@@ -109,6 +113,39 @@ claude mcp add ffmpeg -- node C:/Users/user/Desktop/ffmpeg-mcp/dist/index.js
 {"action": "thumbnail", "input": "in.mp4", "output": "t1.jpg", "time": 10, "size": [640, 360]}
 {"action": "thumbnail", "input": "in.mp4", "output": "t2.jpg", "time": 20, "size": [640, 360]}
 {"action": "thumbnail", "input": "in.mp4", "output": "t3.jpg", "time": 30, "size": [640, 360]}
+```
+
+ラウドネス正規化 (podcast / YouTube 公開用):
+
+```json
+{"action": "loudnorm", "input": "raw.wav", "output": "normalized.m4a",
+ "target_i": -14, "target_tp": -1.0, "target_lra": 7,
+ "audio_codec": "aac", "audio_bitrate": "192k"}
+```
+
+ロゴ透かし (右上 10% サイズ、60% 透過):
+
+```json
+{"action": "watermark", "input": "in.mp4", "output": "out.mp4",
+ "watermark_path": "logo.png",
+ "position": "top-right", "margin": 20,
+ "watermark_scale": 0.1, "opacity": 0.6}
+```
+
+2x 早回し:
+
+```json
+{"action": "speed", "input": "in.mp4", "output": "2x.mp4", "speed_factor": 2.0}
+```
+
+複数動画を一括処理 (最初の失敗で中断):
+
+```json
+{"action": "batch", "stop_on_error": true, "jobs": [
+  {"action": "trim", "input": "raw.mp4", "output": "clip.mp4", "start": 10, "duration": 30},
+  {"action": "convert", "input": "clip.mp4", "output": "final.mp4", "video_codec": "libx264", "crf": 20},
+  {"action": "thumbnail", "input": "final.mp4", "output": "poster.jpg", "time": 5}
+]}
 ```
 
 `run` で完全制御（例: フィルタ複雑グラフ）:
