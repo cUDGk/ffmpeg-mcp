@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { spawn, execFileSync, type ChildProcess } from "node:child_process";
+import { spawn, execFile, type ChildProcess } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path, { join, resolve } from "node:path";
@@ -15,6 +15,7 @@ function parsePositiveInt(s: string | undefined, fallback: number): number {
 }
 const DEFAULT_TIMEOUT = parsePositiveInt(process.env.FFMPEG_TIMEOUT, 600000);
 const MAX_STDERR = 16384;
+const MAX_STDOUT = 8 * 1024 * 1024; // 8 MiB
 const MAX_JOBS = parsePositiveInt(process.env.FFMPEG_MCP_MAX_JOBS, 32);
 
 // MCP response shape (mirrors what the SDK accepts; loose enough for our needs).
@@ -158,48 +159,112 @@ type RunResult = {
   timed_out: boolean;
 };
 
-function killProc(proc: ChildProcess): void {
-  if (!proc.pid) return;
+async function killProc(proc: ChildProcess): Promise<void> {
+  // Guard against PID reuse on Windows: if the child has already exited, taskkill
+  // by PID could target an unrelated process that the OS has since assigned the
+  // same PID. exitCode is set on graceful exit; killed is set if we already
+  // signaled it.
+  if (!proc.pid || proc.exitCode !== null || proc.killed) return;
   if (process.platform === "win32") {
-    try {
-      execFileSync("taskkill", ["/F", "/T", "/PID", String(proc.pid)], { stdio: "ignore" });
-      return;
-    } catch {}
+    await new Promise<void>((res) => {
+      execFile("taskkill", ["/F", "/T", "/PID", String(proc.pid)], () => res());
+    });
+    return;
   }
   try { proc.kill("SIGKILL"); } catch {}
 }
 
-function runCmd(cmd: string, args: string[], opts: { timeout?: number } = {}): Promise<RunResult> {
+type RunOpts = { timeout?: number; truncateStderr?: boolean };
+
+// Slice the trailing `maxBytes` of `buf` without splitting a multi-byte UTF-8
+// code point. UTF-8 continuation bytes match (b & 0xC0) === 0x80; we walk
+// forward from the naive cut point until we hit a leading byte (or run out).
+function tailUtf8Safe(buf: Buffer, maxBytes: number): Buffer {
+  if (buf.length <= maxBytes) return buf;
+  let cut = buf.length - maxBytes;
+  while (cut < buf.length && (buf[cut]! & 0xC0) === 0x80) cut++;
+  return buf.subarray(cut);
+}
+
+function runCmd(cmd: string, args: string[], opts: RunOpts = {}): Promise<RunResult> {
   const t0 = Date.now();
   const to = opts.timeout ?? DEFAULT_TIMEOUT;
+  const truncateStderr = opts.truncateStderr !== false;
   return new Promise((res) => {
     const proc = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
     let timedOut = false;
+    // ENOENT and other spawn errors fire both 'error' and 'close'; settle once.
+    let settled = false;
+    const settle = (r: RunResult) => {
+      if (settled) return;
+      settled = true;
+      res(r);
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      killProc(proc);
+      // fire and forget; we still want to settle on close.
+      void killProc(proc);
     }, to);
-    proc.stdout!.on("data", (c) => { stdout += c.toString("utf8"); });
-    proc.stderr!.on("data", (c) => {
-      stderr += c.toString("utf8");
-      if (stderr.length > MAX_STDERR * 2) stderr = stderr.slice(-MAX_STDERR);
+    proc.stdout!.on("data", (c: Buffer) => {
+      stdoutBytes += c.length;
+      stdoutChunks.push(c);
+      if (stdoutBytes > MAX_STDOUT * 2) {
+        // keep only the trailing slab to bound memory; align to a UTF-8 leading
+        // byte so .toString("utf8") later doesn't insert U+FFFD at the seam.
+        const merged = Buffer.concat(stdoutChunks);
+        const trimmed = tailUtf8Safe(merged, MAX_STDOUT);
+        stdoutChunks.length = 0;
+        stdoutChunks.push(trimmed);
+        stdoutBytes = trimmed.length;
+      }
     });
+    proc.stderr!.on("data", (c: Buffer) => {
+      stderrBytes += c.length;
+      stderrChunks.push(c);
+      if (truncateStderr && stderrBytes > MAX_STDERR * 2) {
+        const merged = Buffer.concat(stderrChunks);
+        const trimmed = tailUtf8Safe(merged, MAX_STDERR);
+        stderrChunks.length = 0;
+        stderrChunks.push(trimmed);
+        stderrBytes = trimmed.length;
+      }
+    });
+    // Avoid unhandled EPIPE on Windows when killing the child mid-write.
+    proc.stdout!.on("error", () => {});
+    proc.stderr!.on("error", () => {});
     proc.on("error", (err) => {
       clearTimeout(timer);
-      res({
-        exit_code: null, signal: null, stdout,
+      const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+      settle({
+        exit_code: null,
+        signal: null,
+        stdout,
         stderr: `spawn error: ${err.message}. Is "${cmd}" on PATH?`,
-        duration_ms: Date.now() - t0, timed_out: false,
+        duration_ms: Date.now() - t0,
+        timed_out: false,
       });
     });
     proc.on("close", (code, signal) => {
       clearTimeout(timer);
-      if (stderr.length > MAX_STDERR) stderr = stderr.slice(-MAX_STDERR);
-      res({
-        exit_code: code, signal: signal ?? null, stdout, stderr,
-        duration_ms: Date.now() - t0, timed_out: timedOut,
+      let stdout = Buffer.concat(stdoutChunks).toString("utf8");
+      let stderr = Buffer.concat(stderrChunks).toString("utf8");
+      if (truncateStderr && stderr.length > MAX_STDERR) {
+        stderr = stderr.slice(-MAX_STDERR);
+      }
+      if (stdout.length > MAX_STDOUT) {
+        stdout = stdout.slice(-MAX_STDOUT);
+      }
+      settle({
+        exit_code: code,
+        signal: signal ?? null,
+        stdout,
+        stderr,
+        duration_ms: Date.now() - t0,
+        timed_out: timedOut,
       });
     });
   });
@@ -341,6 +406,19 @@ async function convert(p: ConvertParams) {
   return runCmd(FFMPEG, args, { timeout: p.timeout });
 }
 
+// Best-effort parse of a seek value to seconds. Accepts plain numbers ("12.5"),
+// hh:mm:ss(.fff) form, and bare numbers. Returns NaN if neither shape matches —
+// caller should treat NaN as "unparseable, skip comparison" rather than reject,
+// because ffmpeg accepts other forms (e.g. "1h30m") that we don't want to refuse
+// outright in validation.
+function parseTimeToSec(v: string | number): number {
+  if (typeof v === "number") return v;
+  if (/^\d+(\.\d+)?$/.test(v)) return parseFloat(v);
+  const m = v.match(/^(\d+):(\d{1,2}):(\d{1,2}(?:\.\d+)?)$/);
+  if (m) return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+  return NaN;
+}
+
 type TrimParams = {
   input: string; output: string;
   start: string | number; end?: string | number; duration?: string | number;
@@ -348,14 +426,39 @@ type TrimParams = {
 };
 
 async function trim(p: TrimParams) {
+  const copyMode = p.copy !== false;
+  // Validate end > start whenever both values can be parsed to finite seconds —
+  // covers both numeric and "hh:mm:ss" string timestamps. If either is in a form
+  // we can't parse (e.g. "1h30m"), skip validation rather than reject.
+  const startSec = parseTimeToSec(p.start);
+  const endSec = p.end !== undefined ? parseTimeToSec(p.end) : NaN;
+  if (
+    p.end !== undefined &&
+    Number.isFinite(startSec) &&
+    Number.isFinite(endSec) &&
+    !(endSec > startSec)
+  ) {
+    throw new Error(`trim: end (${p.end}) must be greater than start (${p.start})`);
+  }
   const args: string[] = [];
   args.push(...PROTOCOL_WHITELIST);
   args.push(overwriteFlag(p.overwrite));
+  // copy mode uses fast-seek (-ss before -i). In that mode ffmpeg interprets
+  // -to relative to the *output* clock, so {start: 10, end: 30} would produce
+  // a 30 s output instead of 20 s. Convert -to into -t (duration) whenever both
+  // ends parse to finite seconds, regardless of mixed string/number types.
   args.push("-ss", String(p.start));
   args.push("-i", safeInputPath(p.input));
-  if (p.end !== undefined) args.push("-to", String(p.end));
-  else if (p.duration !== undefined) args.push("-t", String(p.duration));
-  if (p.copy !== false) args.push("-c", "copy");
+  if (p.end !== undefined) {
+    if (copyMode && Number.isFinite(startSec) && Number.isFinite(endSec)) {
+      args.push("-t", String(endSec - startSec));
+    } else {
+      args.push("-to", String(p.end));
+    }
+  } else if (p.duration !== undefined) {
+    args.push("-t", String(p.duration));
+  }
+  if (copyMode) args.push("-c", "copy");
   args.push(assertWritable(p.output));
   return runCmd(FFMPEG, args, { timeout: p.timeout });
 }
@@ -494,7 +597,7 @@ async function watermark(p: {
   return runCmd(FFMPEG, args, { timeout: p.timeout });
 }
 
-async function loudnormPass1(input: string): Promise<{
+async function loudnormPass1(input: string, timeout?: number): Promise<{
   input_i: number; input_tp: number; input_lra: number;
   input_thresh: number; target_offset: number;
 }> {
@@ -505,18 +608,24 @@ async function loudnormPass1(input: string): Promise<{
     "-af", "loudnorm=print_format=json",
     "-f", "null", process.platform === "win32" ? "NUL" : "/dev/null",
   ];
-  const r = await runCmd(FFMPEG, args);
-  // loudnorm prints the JSON block at the END of stderr
+  // loudnorm prints the JSON block at the end of stderr — do not truncate.
+  const r = await runCmd(FFMPEG, args, { timeout, truncateStderr: false });
   const match = r.stderr.match(/\{[\s\S]*?"target_offset"\s*:[\s\S]*?\}/);
   if (!match) throw new Error(`loudnorm pass 1 failed to print JSON block. stderr tail:\n${r.stderr.slice(-2000)}`);
   const j = JSON.parse(match[0]);
-  return {
-    input_i: parseFloat(j.input_i),
-    input_tp: parseFloat(j.input_tp),
-    input_lra: parseFloat(j.input_lra),
-    input_thresh: parseFloat(j.input_thresh),
-    target_offset: parseFloat(j.target_offset),
+  const fields = ["input_i", "input_tp", "input_lra", "input_thresh", "target_offset"] as const;
+  const parsed: Record<(typeof fields)[number], number> = {
+    input_i: 0, input_tp: 0, input_lra: 0, input_thresh: 0, target_offset: 0,
   };
+  for (const k of fields) {
+    const v = parseFloat(j[k]);
+    if (!Number.isFinite(v)) {
+      // ffmpeg prints "-inf" for silent input; loudnorm pass 2 cannot consume that.
+      throw new Error(`loudnorm pass 1 produced non-finite ${k}=${JSON.stringify(j[k])} (likely silent or too-short input)`);
+    }
+    parsed[k] = v;
+  }
+  return parsed;
 }
 
 async function loudnorm(p: {
@@ -536,7 +645,13 @@ async function loudnorm(p: {
   if (!Number.isFinite(targetI) || !Number.isFinite(targetTP) || !Number.isFinite(targetLRA)) {
     throw new Error("loudnorm: target_i/tp/lra must be finite numbers");
   }
-  const measured = await loudnormPass1(p.input);
+  // Track elapsed time so the user-supplied timeout covers BOTH passes,
+  // not 2× the requested budget.
+  const t0 = Date.now();
+  const measured = await loudnormPass1(p.input, p.timeout);
+  const remaining = p.timeout !== undefined
+    ? Math.max(1000, p.timeout - (Date.now() - t0))
+    : undefined;
   const args: string[] = [];
   args.push(...PROTOCOL_WHITELIST);
   args.push(overwriteFlag(p.overwrite));
@@ -555,15 +670,24 @@ async function loudnorm(p: {
   if (p.audio_bitrate) args.push("-b:a", p.audio_bitrate);
   args.push("-ar", "48000");
   args.push(assertWritable(p.output));
-  const r = await runCmd(FFMPEG, args, { timeout: p.timeout });
+  const r = await runCmd(FFMPEG, args, { timeout: remaining });
   return { ...r, measured, target: { I: targetI, TP: targetTP, LRA: targetLRA } };
 }
 
 function buildAtempoChain(speed: number): string {
+  // Guard against Infinity (would loop forever halving) and absurdly small values
+  // (would loop forever doubling). atempo accepts 0.5..100.0 per stage; this also
+  // protects callers that didn't pre-validate.
+  if (!Number.isFinite(speed) || speed <= 0) {
+    throw new Error(`atempo: invalid speed ${speed}`);
+  }
+  if (speed < 1e-6) {
+    throw new Error(`atempo: speed ${speed} too small`);
+  }
   const filters: string[] = [];
   let s = speed;
   while (s > 2.0) { filters.push("atempo=2.0"); s /= 2.0; }
-  while (s < 0.5) { filters.push("atempo=0.5"); s /= 0.5; }
+  while (s < 0.5) { filters.push("atempo=0.5"); s *= 2.0; }
   if (Math.abs(s - 1) > 1e-6) filters.push(`atempo=${s}`);
   return filters.length ? filters.join(",") : "anull";
 }
@@ -576,7 +700,12 @@ async function changeSpeed(p: {
   overwrite?: boolean;
   timeout?: number;
 }) {
-  if (p.speed <= 0) throw new Error("speed must be > 0");
+  if (!Number.isFinite(p.speed) || p.speed <= 0) {
+    throw new Error("speed must be a positive finite number");
+  }
+  if (p.video_only && p.audio_only) {
+    throw new Error("speed: video_only and audio_only cannot both be true");
+  }
   const args: string[] = [];
   args.push(...PROTOCOL_WHITELIST);
   args.push(overwriteFlag(p.overwrite));
@@ -688,9 +817,19 @@ async function version() {
     runCmd(FFPROBE, ["-version"], { timeout: 10000 }),
   ]);
   const firstLine = (s: string) => (s.split(/\r?\n/)[0] ?? "").trim();
+  // Only treat the first stdout/stderr line as a version string when the binary
+  // actually exited 0. On spawn failure (ENOENT) stderr contains "spawn error: ..."
+  // — surfacing that as `ffmpeg: "spawn error: ..."` is misleading; null says
+  // "no version available" cleanly.
+  const ffmpegLine = m.exit_code === 0 ? (firstLine(m.stdout) || null) : null;
+  const ffprobeLine = p.exit_code === 0 ? (firstLine(p.stdout) || null) : null;
+  const ok = m.exit_code === 0 && p.exit_code === 0 && !!ffmpegLine && !!ffprobeLine;
   return {
-    ffmpeg: firstLine(m.stdout) || firstLine(m.stderr),
-    ffprobe: firstLine(p.stdout) || firstLine(p.stderr),
+    ok,
+    ffmpeg: ffmpegLine,
+    ffprobe: ffprobeLine,
+    ffmpeg_exit: m.exit_code,
+    ffprobe_exit: p.exit_code,
   };
 }
 
@@ -812,7 +951,7 @@ Env: FFMPEG_PATH, FFPROBE_PATH, FFMPEG_TIMEOUT, FFMPEG_MCP_ALLOW_ROOTS (path-del
         return runResponse(await run({ args: rawArgs, use_ffprobe: params.use_ffprobe, timeout: params.timeout }));
       }
       if (a === "version") {
-        return textContent(await version());
+        return okResponse(await version());
       }
       if (a === "watermark") {
         if (!params.input || !params.output || !params.watermark_path) return errContent("watermark requires 'input', 'output', 'watermark_path'");
@@ -873,6 +1012,10 @@ Env: FFMPEG_PATH, FFPROBE_PATH, FFMPEG_TIMEOUT, FFMPEG_MCP_ALLOW_ROOTS (path-del
 
 // reference coerceObject so dead-code elimination doesn't complain & for future use
 void coerceObject;
+
+process.on("unhandledRejection", (err) => {
+  console.error("Unhandled:", err);
+});
 
 async function main() {
   const transport = new StdioServerTransport();
