@@ -301,6 +301,39 @@ function overwriteFlag(overwrite: boolean | undefined): "-y" | "-n" {
 
 // ---------- actions ----------
 
+// Minimal ffprobe stream shape — every field optional because ffprobe omits
+// inapplicable keys (e.g. width/height for audio streams).
+type FfprobeStream = {
+  index?: number;
+  codec_type?: string;
+  codec_name?: string;
+  codec_long_name?: string;
+  profile?: string;
+  width?: number;
+  height?: number;
+  coded_width?: number;
+  coded_height?: number;
+  display_aspect_ratio?: string;
+  sample_aspect_ratio?: string;
+  pix_fmt?: string;
+  color_space?: string;
+  color_range?: string;
+  color_transfer?: string;
+  color_primaries?: string;
+  field_order?: string;
+  r_frame_rate?: string;
+  avg_frame_rate?: string;
+  nb_frames?: string;
+  sample_rate?: string;
+  channels?: number;
+  channel_layout?: string;
+  bit_rate?: string;
+  duration?: string;
+  time_base?: string;
+  disposition?: Record<string, number>;
+  tags?: Record<string, string>;
+};
+
 async function probe(input: string) {
   const r = await runCmd(FFPROBE, [
     ...PROTOCOL_WHITELIST,
@@ -316,7 +349,7 @@ async function probe(input: string) {
   }
   try {
     const data = JSON.parse(r.stdout);
-    const streams = (data.streams || []).map((s: any) => ({
+    const streams = ((data.streams ?? []) as FfprobeStream[]).map((s) => ({
       index: s.index,
       codec_type: s.codec_type,
       codec_name: s.codec_name,
@@ -361,8 +394,9 @@ async function probe(input: string) {
       streams,
       chapters: data.chapters || [],
     };
-  } catch (e: any) {
-    return { ok: false as const, error: `ffprobe json parse failed: ${e.message}`, raw: r.stdout.slice(0, 1000) };
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { ok: false as const, error: `ffprobe json parse failed: ${msg}`, raw: r.stdout.slice(0, 1000) };
   }
 }
 
@@ -523,7 +557,7 @@ async function thumbnail(p: {
   input: string; output: string;
   time?: string | number; size?: [number, number]; overwrite?: boolean; timeout?: number;
 }) {
-  const t = p.time ?? 0;
+  const t = p.time ?? "00:00:01";
   const args: string[] = [];
   args.push(...PROTOCOL_WHITELIST);
   args.push(overwriteFlag(p.overwrite));
@@ -584,7 +618,7 @@ async function watermark(p: {
     `scale=iw*${scale}:-1`,
     opacity < 1 ? `format=rgba,colorchannelmixer=aa=${opacity}` : null,
   ].filter(Boolean).join(",");
-  const filterComplex = `[1:v]${wmFilter}[wm];[0:v][wm]overlay=${overlayXY[pos]}`;
+  const filterComplex = `[1:v]${wmFilter}[wm];[0:v][wm]overlay=${overlayXY[pos]!}`;
   const args: string[] = [];
   args.push(...PROTOCOL_WHITELIST);
   args.push(overwriteFlag(p.overwrite));
@@ -642,6 +676,8 @@ async function loudnorm(p: {
   const targetTP = p.target_tp ?? -1.5;
   const targetLRA = p.target_lra ?? 11;
   // Reject non-finite targets before they get interpolated into the -af string.
+  // The MCP tool schema is z.number() (no NaN guarantee on coerce paths) and the
+  // batch path forwards arbitrary { ...job } values via passthrough().
   if (!Number.isFinite(targetI) || !Number.isFinite(targetTP) || !Number.isFinite(targetLRA)) {
     throw new Error("loudnorm: target_i/tp/lra must be finite numbers");
   }
@@ -754,7 +790,7 @@ async function batch(p: { jobs: BatchJob[]; stop_on_error?: boolean }) {
   const results: BatchResult[] = [];
   for (const [i, job] of p.jobs.entries()) {
     try {
-      let r: any;
+      let r: RunResult | (RunResult & Record<string, unknown>);
       switch (job.action) {
         case "convert": r = await convert(job as unknown as ConvertParams); break;
         case "trim": r = await trim(job as any); break;
@@ -785,14 +821,14 @@ async function batch(p: { jobs: BatchJob[]; stop_on_error?: boolean }) {
         case "run": r = await run(job as any); break;
         default: throw new Error(`unknown batch action: ${(job as { action: string }).action}`);
       }
-      const ok = (r as any).exit_code === 0;
+      const ok = r.exit_code === 0;
       results.push({
         index: i,
         action: job.action,
         ok,
-        exit_code: (r as any).exit_code,
-        duration_ms: (r as any).duration_ms,
-        stderr: ((r as any).stderr ?? "").slice(-800),
+        exit_code: r.exit_code,
+        duration_ms: r.duration_ms,
+        stderr: (r.stderr ?? "").slice(-800),
       });
       if (!ok && p.stop_on_error) break;
     } catch (err: unknown) {
@@ -833,7 +869,7 @@ async function version() {
   };
 }
 
-// ---------- batch job schema ----------
+// ---------- batch job schema (tightened) ----------
 
 const BATCH_ACTION_VALUES = [
   "convert", "trim", "concat", "extract_audio",
@@ -846,7 +882,7 @@ const batchJobSchema = z
 
 // ---------- MCP server ----------
 
-const server = new McpServer({ name: "ffmpeg", version: "0.3.0" });
+const server = new McpServer({ name: "ffmpeg", version: "0.3.1" });
 
 server.tool(
   "ffmpeg",
@@ -859,6 +895,10 @@ Actions:
 - concat: stream-copy concatenation of input_paths[] via the concat demuxer. All inputs must share codec/params.
 - extract_audio: -vn + optional audio_codec/audio_bitrate. Codec often inferable from output extension.
 - thumbnail: single-frame PNG/JPEG at time (default 00:00:01), optional size=[w,h].
+- watermark: overlay an image (watermark_path) on the input. Supports position (top-left/top-right/bottom-left/bottom-right/center), margin (px), watermark_scale (relative to main width, default 0.15), opacity (0..1).
+- loudnorm: EBU R128 2-pass loudness normalization. target_i (default -16 LUFS), target_tp (default -1.5 dBTP), target_lra (default 11 LU). Optional audio_codec/audio_bitrate.
+- speed: change playback speed. speed_factor > 0 (e.g. 2 = 2x). video_only mutes audio; audio_only stream-copies video.
+- batch: run jobs[] sequentially. Each job is {action, ...args}. stop_on_error aborts on first failure.
 - run: raw passthrough. args=[string,...]. Set use_ffprobe=true to invoke ffprobe instead. Protocol-prefixed paths and file-reading filters are rejected; -protocol_whitelist is forced to file,crypto,data.
 - version: ffmpeg -version / ffprobe -version first lines.
 
@@ -873,40 +913,40 @@ Env: FFMPEG_PATH, FFPROBE_PATH, FFMPEG_TIMEOUT, FFMPEG_MCP_ALLOW_ROOTS (path-del
       "extract_audio", "thumbnail", "run", "version",
       "watermark", "loudnorm", "speed", "batch",
     ]).describe("Action to perform"),
-    input: z.string().optional().describe("Input file path (probe/convert/trim/extract_audio/thumbnail)"),
-    output: z.string().optional().describe("Output file path"),
+    input: z.string().optional().describe("Input file path (probe/convert/trim/extract_audio/thumbnail/watermark/loudnorm/speed)"),
+    output: z.string().optional().describe("Output file path. Required for: convert, trim, concat, extract_audio, thumbnail, watermark, loudnorm, speed. Not used by: probe, run, version, batch."),
     input_paths: z.union([z.array(z.string()), z.string()]).optional().describe("Input paths for concat"),
-    args: z.union([z.array(z.string()), z.string()]).optional().describe("Raw args for the 'run' action"),
+    args: z.union([z.array(z.string()), z.string()]).optional().describe("Raw args for the 'run' action (protocol-prefixed paths and file-reading filters rejected)"),
     use_ffprobe: z.boolean().optional().describe("run: invoke ffprobe instead of ffmpeg"),
     video_codec: z.string().optional().describe("e.g. libx264, libvpx-vp9, copy"),
     audio_codec: z.string().optional().describe("e.g. aac, libmp3lame, libopus, copy"),
-    crf: z.number().optional().describe("x264/x265/VP9 quality (lower = better). x264 typical 18-28"),
+    crf: z.number().int().min(0).max(63).optional().describe("x264/x265/VP9 quality (lower = better, 0-63). x264 typical 18-28"),
     preset: z.string().optional().describe("x264 preset: ultrafast..veryslow"),
-    video_bitrate: z.string().optional().describe("e.g. '2M'"),
-    audio_bitrate: z.string().optional().describe("e.g. '192k'"),
-    fps: z.number().optional().describe("Output frame rate"),
+    video_bitrate: z.string().optional().describe("e.g. '2M', '128k' (string with unit suffix)"),
+    audio_bitrate: z.string().optional().describe("e.g. '2M', '128k' (string with unit suffix)"),
+    fps: z.number().positive().optional().describe("Output frame rate (>0)"),
     resolution: z.union([z.array(z.number()).length(2), z.string()]).optional().describe("[width, height]"),
     start: z.union([z.string(), z.number()]).optional().describe("Seek start (sec or hh:mm:ss)"),
     end: z.union([z.string(), z.number()]).optional().describe("trim: end time"),
     duration: z.union([z.string(), z.number()]).optional().describe("Duration (sec or hh:mm:ss)"),
     copy: z.boolean().optional().describe("trim: stream copy mode (default true)"),
-    time: z.union([z.string(), z.number()]).optional().describe("thumbnail: frame time"),
+    time: z.union([z.string(), z.number()]).optional().describe("thumbnail: frame time (default 00:00:01)"),
     size: z.union([z.array(z.number()).length(2), z.string()]).optional().describe("thumbnail: [w,h]"),
-    overwrite: z.boolean().optional().describe("Overwrite existing output (default false = no clobber). Set true to allow overwrite."),
-    extra_args: z.union([z.array(z.string()), z.string()]).optional().describe("convert: extra ffmpeg args"),
-    timeout: z.number().optional().describe("Per-call timeout ms (run/convert)"),
+    overwrite: z.boolean().optional().describe("Overwrite existing output. Default false (no clobber, ffmpeg -n). Set true to allow overwrite (-y)."),
+    extra_args: z.union([z.array(z.string()), z.string()]).optional().describe("Extra ffmpeg args. Honored by `convert` (and `convert` jobs inside `batch`); ignored by other actions. Protocol-prefixed paths and file-reading filters rejected."),
+    timeout: z.number().int().positive().optional().describe("Per-call timeout ms (>0, overrides FFMPEG_TIMEOUT)"),
     watermark_path: z.string().optional().describe("watermark: overlay image path"),
     position: z.enum(["top-left", "top-right", "bottom-left", "bottom-right", "center"]).optional().describe("watermark: placement"),
-    margin: z.number().optional().describe("watermark: pixels from edge (default 20)"),
+    margin: z.number().min(0).optional().describe("watermark: pixels from edge (>=0, default 20)"),
     watermark_scale: z.number().positive().optional().describe("watermark: relative size vs. main video width (default 0.15 = 15%)"),
     opacity: z.number().min(0).max(1).optional().describe("watermark: alpha 0..1 (default 1)"),
-    target_i: z.number().optional().describe("loudnorm: target integrated LUFS (default -16)"),
-    target_tp: z.number().optional().describe("loudnorm: target true peak dBFS (default -1.5)"),
-    target_lra: z.number().optional().describe("loudnorm: target loudness range (default 11)"),
-    speed_factor: z.number().positive().optional().describe("speed: playback speed multiplier (>0, e.g. 2 = 2x)"),
+    target_i: z.number().optional().describe("loudnorm: target integrated loudness in LUFS (typical -23 to -14, default -16)"),
+    target_tp: z.number().optional().describe("loudnorm: target true-peak in dBTP (default -1.5)"),
+    target_lra: z.number().optional().describe("loudnorm: target loudness range in LU (default 11)"),
+    speed_factor: z.number().positive().max(100).optional().describe("speed: playback speed multiplier (>0, <=100, e.g. 2 = 2x)"),
     video_only: z.boolean().optional().describe("speed: only apply to video (mute audio)"),
     audio_only: z.boolean().optional().describe("speed: only apply to audio (copy video)"),
-    jobs: z.union([z.array(batchJobSchema), z.string()]).optional().describe("batch: list of job specs {action: ..., ...args}"),
+    jobs: z.union([z.array(batchJobSchema), z.string()]).optional().describe("batch: list of job specs {action: <enum>, ...args}. Field aliases inside batch jobs: a `speed` job accepts `speed` or `speed_factor`; a `watermark` job accepts `watermark` or `watermark_path` (and `scale` or `watermark_scale`)."),
     stop_on_error: z.boolean().optional().describe("batch: abort after first failure"),
   },
   async (params): Promise<McpResponse> => {
@@ -926,21 +966,53 @@ Env: FFMPEG_PATH, FFPROBE_PATH, FFMPEG_TIMEOUT, FFMPEG_MCP_ALLOW_ROOTS (path-del
       }
       if (a === "convert") {
         if (!params.input || !params.output) return errContent("convert requires 'input' and 'output'");
-        return runResponse(await convert({ ...params, resolution, extra_args: extraArgs }));
+        return runResponse(await convert({
+          ...params,
+          input: params.input,
+          output: params.output,
+          resolution,
+          extra_args: extraArgs,
+        }));
       }
       if (a === "trim") {
         if (!params.input || !params.output || params.start === undefined) {
           return errContent("trim requires 'input', 'output', 'start'");
         }
-        return runResponse(await trim(params as any));
+        return runResponse(await trim({
+          input: params.input,
+          output: params.output,
+          start: params.start,
+          end: params.end,
+          duration: params.duration,
+          copy: params.copy,
+          overwrite: params.overwrite,
+          timeout: params.timeout,
+        }));
       }
       if (a === "concat") {
-        if (!inputPaths || inputPaths.length === 0 || !params.output) return errContent("concat requires 'input_paths' and 'output'");
-        return runResponse(await concat({ input_paths: inputPaths, output: params.output, overwrite: params.overwrite, timeout: params.timeout }));
+        if (!inputPaths || inputPaths.length === 0 || !params.output) {
+          return errContent("concat requires 'input_paths' and 'output'");
+        }
+        if (!inputPaths.every((x) => typeof x === "string")) {
+          return errContent("concat: every entry in input_paths must be a string");
+        }
+        return runResponse(await concat({
+          input_paths: inputPaths,
+          output: params.output,
+          overwrite: params.overwrite,
+          timeout: params.timeout,
+        }));
       }
       if (a === "extract_audio") {
         if (!params.input || !params.output) return errContent("extract_audio requires 'input' and 'output'");
-        return runResponse(await extractAudio(params as any));
+        return runResponse(await extractAudio({
+          input: params.input,
+          output: params.output,
+          audio_codec: params.audio_codec,
+          audio_bitrate: params.audio_bitrate,
+          overwrite: params.overwrite,
+          timeout: params.timeout,
+        }));
       }
       if (a === "thumbnail") {
         if (!params.input || !params.output) return errContent("thumbnail requires 'input' and 'output'");
@@ -954,7 +1026,9 @@ Env: FFMPEG_PATH, FFPROBE_PATH, FFMPEG_TIMEOUT, FFMPEG_MCP_ALLOW_ROOTS (path-del
         return okResponse(await version());
       }
       if (a === "watermark") {
-        if (!params.input || !params.output || !params.watermark_path) return errContent("watermark requires 'input', 'output', 'watermark_path'");
+        if (!params.input || !params.output || !params.watermark_path) {
+          return errContent("watermark requires 'input', 'output', 'watermark_path'");
+        }
         return runResponse(await watermark({
           input: params.input, output: params.output,
           watermark: params.watermark_path,
@@ -974,7 +1048,9 @@ Env: FFMPEG_PATH, FFPROBE_PATH, FFMPEG_TIMEOUT, FFMPEG_MCP_ALLOW_ROOTS (path-del
         }));
       }
       if (a === "speed") {
-        if (!params.input || !params.output || params.speed_factor === undefined) return errContent("speed requires 'input', 'output', 'speed_factor'");
+        if (!params.input || !params.output || params.speed_factor === undefined) {
+          return errContent("speed requires 'input', 'output', 'speed_factor'");
+        }
         return runResponse(await changeSpeed({
           input: params.input, output: params.output,
           speed: params.speed_factor,
@@ -987,18 +1063,51 @@ Env: FFMPEG_PATH, FFPROBE_PATH, FFMPEG_TIMEOUT, FFMPEG_MCP_ALLOW_ROOTS (path-del
         if (jobs.length > MAX_JOBS) {
           return errContent(`batch: jobs.length=${jobs.length} exceeds FFMPEG_MCP_MAX_JOBS=${MAX_JOBS}`);
         }
+        // Coerce nested arrays inside each job (LLM may JSON-stringify them).
         const normalizedJobs: BatchJob[] = [];
         for (const j of jobs) {
           const nj: Record<string, unknown> = { ...j };
-          if ("extra_args" in nj) nj.extra_args = coerceArray<string>(nj.extra_args) ?? nj.extra_args;
-          if ("resolution" in nj) nj.resolution = coerceArray<number>(nj.resolution) ?? nj.resolution;
-          if ("size" in nj) nj.size = coerceArray<number>(nj.size) ?? nj.size;
-          if ("args" in nj) nj.args = coerceArray<string>(nj.args) ?? nj.args;
-          if ("input_paths" in nj) nj.input_paths = coerceArray<string>(nj.input_paths) ?? nj.input_paths;
+          if ("extra_args" in nj) {
+            const v = coerceArray<string>(nj.extra_args);
+            if (nj.extra_args !== undefined && v === undefined) {
+              return errContent(`batch job has extra_args that is not an array of strings: ${JSON.stringify(nj.extra_args)}`);
+            }
+            nj.extra_args = v;
+          }
+          if ("resolution" in nj) {
+            const v = coerceArray<number>(nj.resolution);
+            if (nj.resolution !== undefined && v === undefined) {
+              return errContent(`batch job has resolution that is not [w,h]: ${JSON.stringify(nj.resolution)}`);
+            }
+            nj.resolution = v;
+          }
+          if ("size" in nj) {
+            const v = coerceArray<number>(nj.size);
+            if (nj.size !== undefined && v === undefined) {
+              return errContent(`batch job has size that is not [w,h]: ${JSON.stringify(nj.size)}`);
+            }
+            nj.size = v;
+          }
+          if ("args" in nj) {
+            const v = coerceArray<string>(nj.args);
+            if (nj.args !== undefined && v === undefined) {
+              return errContent(`batch job has args that is not an array of strings: ${JSON.stringify(nj.args)}`);
+            }
+            nj.args = v;
+          }
+          if ("input_paths" in nj) {
+            const v = coerceArray<string>(nj.input_paths);
+            if (nj.input_paths !== undefined && v === undefined) {
+              return errContent(`batch job has input_paths that is not an array of strings: ${JSON.stringify(nj.input_paths)}`);
+            }
+            nj.input_paths = v;
+          }
           normalizedJobs.push(nj as BatchJob);
         }
         const result = await batch({ jobs: normalizedJobs, stop_on_error: params.stop_on_error });
         const res = textContent(result);
+        // isError when anything went wrong, including stop_on_error early-exit
+        // where some jobs were never processed.
         if (result.failed > 0 || result.processed < result.total) res.isError = true;
         return res;
       }

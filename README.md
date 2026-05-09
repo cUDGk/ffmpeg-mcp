@@ -34,7 +34,7 @@ LLM に `ffmpeg -i ... -c:v libx264 ...` を文字列として書かせると、
 | `probe` | ffprobe を JSON で叩き、format / streams / chapters を間引いて返す（未知ファイルへの第一手） |
 | `convert` | 再エンコード。`video_codec` / `audio_codec` / `crf` / `preset` / `video_bitrate` / `audio_bitrate` / `fps` / `resolution=[w,h]` / オプションの `start`・`duration` / `extra_args` |
 | `trim` | 既定で `-c copy` による**無劣化カット**（再エンコードなし、ほぼ瞬時）。`copy: false` で再エンコード可。**精度注意**: copy モードは I-frame 単位で seek する為、`start` が最大数秒ズレる事がある（ffmpeg の仕様）。フレーム精度が必要なら `copy: false` |
-| `concat` | concat デマクサで `input_paths[]` を無劣化結合（全入力が同コーデック/同パラメータ前提） |
+| `concat` | concat デマクサで `input_paths: string[]` を無劣化結合（全入力が同コーデック/同パラメータ前提） |
 | `extract_audio` | `-vn` + オプションで `audio_codec` / `audio_bitrate`。拡張子でコーデック自動選択 |
 | `thumbnail` | 指定時刻（既定 `00:00:01`）の 1 フレームを画像として書き出し、`size=[w,h]` で縮小可 |
 | `run` | 生 args の escape hatch。`use_ffprobe: true` で ffprobe を叩く |
@@ -59,7 +59,7 @@ sequenceDiagram
     MCP-->>LLM: {format, streams[], chapters[]}
 
     LLM->>MCP: {action: "convert", input, output, crf: 23, preset: "medium"}
-    MCP->>FF: spawn(ffmpeg, [-y, -i, in.mp4, -crf, 23, -preset, medium, out.mp4])
+    MCP->>FF: spawn(ffmpeg, [-n, -i, in.mp4, -crf, 23, -preset, medium, out.mp4])
     FF-->>MCP: exit_code / stdout / stderr(tail) / duration_ms
     MCP-->>LLM: JSON
 ```
@@ -80,7 +80,7 @@ ffmpeg と ffprobe が PATH にある事が前提。別パスにある場合は 
 ### Claude Code に登録
 
 ```bash
-claude mcp add ffmpeg -- node C:/Users/user/Desktop/ffmpeg-mcp/dist/index.js
+claude mcp add ffmpeg -- node <install-dir>/dist/index.js
 ```
 
 ### 環境変数
@@ -90,6 +90,26 @@ claude mcp add ffmpeg -- node C:/Users/user/Desktop/ffmpeg-mcp/dist/index.js
 | `FFMPEG_PATH` | `ffmpeg` | ffmpeg 実行ファイル |
 | `FFPROBE_PATH` | `ffprobe` | ffprobe 実行ファイル |
 | `FFMPEG_TIMEOUT` | `600000` | 単一呼び出しのタイムアウト (ms) |
+| `FFMPEG_MCP_ALLOW_ROOTS` | (未設定) | 出力先のホワイトリスト（OS の `path.delimiter` 区切り — Windows は `;`、POSIX は `:`）。設定すると、ここで挙げたディレクトリ配下にしか出力できない |
+| `FFMPEG_MCP_MAX_JOBS` | `32` | `batch.jobs[]` の上限 |
+
+`FFMPEG_MCP_ALLOW_ROOTS` の例:
+
+```powershell
+# Windows (PowerShell): 区切りは ";"
+$env:FFMPEG_MCP_ALLOW_ROOTS = "C:\Users\me\videos;D:\renders"
+```
+
+```bash
+# Linux / macOS: 区切りは ":"
+export FFMPEG_MCP_ALLOW_ROOTS="/home/me/videos:/srv/renders"
+```
+
+### セキュリティ
+
+- **既定で出力ファイルは上書きしない (`ffmpeg -n`)**。意図的に上書きしたい場合は `overwrite: true` を渡す（`ffmpeg -y`）。
+- **`run` / `convert.extra_args` は無検査ではない**。ffmpeg のプロトコルプレフィックス (`concat:`, `subfile:`, `http:`, `file:`, `tee:`, `data:` 等) や、ファイルを読む系のフィルタ (`movie=...`, `subtitles=...`, `drawtext=...textfile=...`, `sendcmd=...`) や、`-protocol_whitelist` 上書き / `-f tee` は拒否する。それ以外の動作については LLM 任せにせず、ホスト側でも `FFMPEG_MCP_ALLOW_ROOTS` を設定する事を推奨する。
+- 全ての `-i` 呼び出しに `-protocol_whitelist file,crypto,data` を強制注入する（HTTP/RTMP/RTSP 経由の任意 URL fetch を遮断する）。
 
 ### 呼び出し例
 
@@ -166,6 +186,45 @@ claude mcp add ffmpeg -- node C:/Users/user/Desktop/ffmpeg-mcp/dist/index.js
 - **stderr は末尾 16 KB だけ残す**。ffmpeg は 1 回の実行で数 MB のログを吐く事があり、LLM のコンテキストを焼き尽くす。
 - **相対パスは CWD から resolve**。LLM が相対パスを渡しても意図通りの場所に書き出される。
 - **タイムアウト既定 10 分**。長時間エンコードは `timeout` で上書き。
+
+## v0.3.1 修正
+
+バグ修正:
+- `batch` の `watermark` ジョブで `watermark_path` → `watermark` / `watermark_scale` → `scale` のフィールドマッピングが欠落していた問題を修正（ウォーターマーク画像と scale が常に無視されていた）。
+- `batch` の `speed` ジョブで `speed_factor` → `speed` のフィールドマッピングが欠落していた問題を修正（`speed` が undefined になり `Number.isFinite` チェックで必ずエラーになっていた）。
+- README の mermaid ダイアグラムで `-y` と表示されていたのを `-n` (no-clobber デフォルト) に修正。
+
+## v0.3.0 修正
+
+セキュリティ・バグ・UX を一括で改修したリリース。
+
+セキュリティ:
+- `run` / `convert.extra_args` の引数を `assertSafeFfmpegArgs()` で検査。ffmpeg プロトコルプレフィックス・ファイル読み取り系フィルタ・`-protocol_whitelist` 上書き・`-f tee` を拒否。
+- 全ての `-i` 呼び出しに `-protocol_whitelist file,crypto,data` を強制注入。
+- `safeInputPath()` を全アクションの入力に適用（Windows ドライブレター `C:\...` は許可、`http:` / `concat:` 等は拒否）。
+- 既定値を `-y` (force overwrite) → `-n` (no clobber) に変更。明示的に `overwrite: true` を渡した時だけ上書きする。
+- `FFMPEG_MCP_ALLOW_ROOTS` で出力先をディレクトリ単位でホワイトリスト可能。
+- `FFMPEG_MCP_MAX_JOBS` で `batch.jobs[]` の長さに上限。
+- `concat` のリストファイルに改行を含むエントリを拒否（行ベースパーサを破壊する為）。
+
+バグ修正:
+- stdout / stderr を `Buffer.concat()` で組み立てる様に変更（チャンク境界で UTF-8 が壊れる問題を解消）。
+- stdout にも 8 MiB の上限を導入。
+- `loudnormPass1` の stderr を切り詰めない。loudnorm の JSON ブロックが落ちる事があった。
+- `loudnormPass1` が `timeout` を尊重していなかった問題を修正。
+- `concat()` の `mkdtempSync` を try の中に移動。例外時の temp dir リーク防止。
+- `proc.stdout` / `proc.stderr` に `error` リスナを追加（Windows での EPIPE 未処理を防止）。
+- `killProc` を非同期化（`execFileSync` でイベントループを止めない）。
+- `speed` で `setpts=Infinity*PTS` を防ぐバリデーション。
+- `version` の戻り値が空 / 非 0 終了時に `isError: true` を立てる様に。
+- `tsconfig.json` に `noUncheckedIndexedAccess: true`。
+
+UX:
+- ツール説明に `watermark` / `loudnorm` / `speed` / `batch` を追記。
+- `thumbnail` のデフォルト `time` をドキュメント通りの `00:00:01` に。
+- `batch.jobs[].action` を厳密な enum に。
+- `batch` で 1 件でも失敗したら全体の `isError` を立てる。
+- `extra_args` が convert 専用である事を明記。
 
 ## v0.2.1 修正
 
